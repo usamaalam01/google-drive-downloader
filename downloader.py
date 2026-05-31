@@ -111,44 +111,61 @@ def list_root_files(service, root_id):
 
 def scan_folder_tree(service, folder_id, folder_path: Path):
     """
-    Recursively scan a single folder subtree.
-    Returns list of (file_dict, local_path) for all non-folder files.
+    Fetch ALL files under a folder subtree in one paginated scan using
+    a Drive corpus query, then resolve paths via parent relationships.
+    Much faster than recursive per-folder API calls.
     """
-    results = []
-    _scan_recursive(service, folder_id, folder_path, results, seen_names={})
-    return results
+    print(f"  Fetching file list...", end="", flush=True)
 
-
-def _scan_recursive(service, folder_id, folder_path: Path, results: list, seen_names: dict):
+    # Collect every non-trashed file whose ancestry includes folder_id.
+    # We fetch all files from My Drive and filter to those inside our target.
+    id_map = {}      # file_id -> file dict
+    children_map = {}  # parent_id -> [child_id, ...]
     page_token = None
-    children = []
+    total = 0
+
     while True:
         resp = service.files().list(
-            q=f"'{folder_id}' in parents and trashed = false",
+            q="trashed = false",
             pageSize=1000,
-            fields="nextPageToken, files(id, name, mimeType, size)",
+            fields="nextPageToken, files(id, name, mimeType, size, parents)",
+            spaces="drive",
         ).execute()
-        children.extend(resp.get("files", []))
+        for f in resp.get("files", []):
+            id_map[f["id"]] = f
+            for p in f.get("parents", []):
+                children_map.setdefault(p, []).append(f["id"])
+        total += len(resp.get("files", []))
+        print(f"\r  Fetching file list... {total} items", end="", flush=True)
         page_token = resp.get("nextPageToken")
         if not page_token:
             break
 
-    local_seen = {}
-    for child in children:
-        raw_name = sanitize_name(child["name"])
-        if raw_name in local_seen:
-            local_seen[raw_name] += 1
-            unique_name = f"{raw_name}_({child['id'][:8]})"
-        else:
-            local_seen[raw_name] = 1
-            unique_name = raw_name
+    print(f"\r  Fetching file list... {total} items. Resolving paths...", flush=True)
 
-        child_path = folder_path / unique_name
+    results = []
 
-        if child["mimeType"] == GOOGLE_APPS_FOLDER:
-            _scan_recursive(service, child["id"], child_path, results, {})
-        else:
-            results.append((child, child_path))
+    def walk(fid, path):
+        seen = {}
+        for child_id in children_map.get(fid, []):
+            child = id_map.get(child_id)
+            if child is None:
+                continue
+            raw = sanitize_name(child["name"])
+            if raw in seen:
+                seen[raw] += 1
+                unique = f"{raw}_({child_id[:8]})"
+            else:
+                seen[raw] = 1
+                unique = raw
+            child_path = path / unique
+            if child["mimeType"] == GOOGLE_APPS_FOLDER:
+                walk(child_id, child_path)
+            else:
+                results.append((child, child_path))
+
+    walk(folder_id, folder_path)
+    return results
 
 
 def ensure_dir(path: Path):
